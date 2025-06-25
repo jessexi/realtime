@@ -172,7 +172,7 @@ defmodule RealtimeWeb.RealtimeChannel.PresenceHandler do
   end
 
   defp count(%{assigns: %{presence_rate_counter: presence_counter}} = socket) do
-    Logger.debug("[WS-RLS-DEBUG] 增加在线状态计数器 - 计数器ID: #{presence_counter.id}")
+    Logger.debug("[WS-RLS-DEBUG] 增加在线状态计数器 - 计数器ID: #{inspect(presence_counter.id)}")
     GenCounter.add(presence_counter.id)
     {:ok, presence_rate_counter} = RateCounter.get(presence_counter.id)
 

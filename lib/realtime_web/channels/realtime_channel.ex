@@ -140,7 +140,6 @@ defmodule RealtimeWeb.RealtimeChannel do
           Logger.debug("[WS-INIT-DEBUG] 数据库连接失败 - 错误: #{inspect(error)}")
           error
       end
-    end
     else
       {:error, :expired_token, msg} ->
         Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 令牌已过期: #{msg}")
