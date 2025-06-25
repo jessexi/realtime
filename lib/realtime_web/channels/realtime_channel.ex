@@ -43,14 +43,22 @@ defmodule RealtimeWeb.RealtimeChannel do
 
     Logger.metadata(external_id: tenant_id, project: tenant_id)
     Logger.put_process_level(self(), log_level)
+    
+    Logger.debug("[WS-INIT-DEBUG] 开始WebSocket连接初始化 - 租户: #{tenant_id}, 主题: #{topic}, 参数: #{inspect(params)}")
+    Logger.debug("[WS-INIT-DEBUG] 通道PID: #{inspect(channel_pid)}, 传输PID: #{inspect(transport_pid)}")
+    
+    is_private = !!params["config"]["private"]
+    Logger.debug("[WS-INIT-DEBUG] 通道类型: #{if is_private, do: "私有", else: "公共"}")
 
     socket =
       socket
       |> assign_access_token(params)
       |> assign_counter()
       |> assign_presence_counter()
-      |> assign(:private?, !!params["config"]["private"])
+      |> assign(:private?, is_private)
       |> assign(:policies, nil)
+      
+    Logger.debug("[WS-INIT-DEBUG] Socket初始化完成 - 访问令牌已分配, 计数器已初始化")
 
     with :ok <- SignalHandler.shutdown_in_progress?(),
          :ok <- only_private?(tenant_id, socket),
@@ -58,86 +66,127 @@ defmodule RealtimeWeb.RealtimeChannel do
          :ok <- limit_channels(socket),
          :ok <- limit_max_users(socket.assigns),
          :ok <- start_db_rate_counter(tenant_id),
-         {:ok, claims, confirm_token_ref, access_token, _} <- confirm_token(socket),
-         {:ok, db_conn} <- Connect.lookup_or_start_connection(tenant_id),
-         socket = assign_authorization_context(socket, sub_topic, access_token, claims),
-         {:ok, socket} <- maybe_assign_policies(sub_topic, db_conn, socket) do
-      tenant_topic = Tenants.tenant_topic(tenant_id, sub_topic, !socket.assigns.private?)
+         {:ok, claims, confirm_token_ref, access_token, _} <- confirm_token(socket) do
+      
+      Logger.debug("[WS-INIT-DEBUG] 令牌验证成功 - 租户: #{tenant_id}, 角色: #{claims["role"]}")
+      Logger.debug("[WS-INIT-DEBUG] 令牌声明: #{inspect(claims)}")
+      
+      case Connect.lookup_or_start_connection(tenant_id) do
+        {:ok, db_conn} ->
+          Logger.debug("[WS-INIT-DEBUG] 数据库连接成功 - 租户: #{tenant_id}, 连接PID: #{inspect(db_conn)}")
+          
+          socket = assign_authorization_context(socket, sub_topic, access_token, claims)
+          Logger.debug("[WS-INIT-DEBUG] 授权上下文已分配 - 主题: #{sub_topic}")
+          
+          case maybe_assign_policies(sub_topic, db_conn, socket) do
+            {:ok, socket} ->
+              tenant_topic = Tenants.tenant_topic(tenant_id, sub_topic, !socket.assigns.private?)
+              Logger.debug("[WS-INIT-DEBUG] 租户主题已创建 - #{tenant_topic}")
 
-      RealtimeWeb.Endpoint.subscribe(tenant_topic)
-      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant_id)
+              RealtimeWeb.Endpoint.subscribe(tenant_topic)
+              Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant_id)
+              Logger.debug("[WS-INIT-DEBUG] 已订阅主题和操作通道")
 
-      is_new_api = new_api?(params)
-      pg_change_params = pg_change_params(is_new_api, params, channel_pid, claims, sub_topic)
+              is_new_api = new_api?(params)
+              pg_change_params = pg_change_params(is_new_api, params, channel_pid, claims, sub_topic)
+              Logger.debug("[WS-INIT-DEBUG] PostgreSQL变更参数已创建 - 新API: #{is_new_api}")
+              Logger.debug("[WS-INIT-DEBUG] 变更参数: #{inspect(pg_change_params)}")
 
-      opts = %{
-        is_new_api: is_new_api,
-        pg_change_params: pg_change_params,
-        transport_pid: transport_pid,
-        serializer: serializer,
-        topic: topic,
-        tenant: tenant_id,
-        module: module
-      }
+              opts = %{
+                is_new_api: is_new_api,
+                pg_change_params: pg_change_params,
+                transport_pid: transport_pid,
+                serializer: serializer,
+                topic: topic,
+                tenant: tenant_id,
+                module: module
+              }
 
-      postgres_cdc_subscribe(opts)
+              postgres_cdc_subscribe(opts)
+              Logger.debug("[WS-INIT-DEBUG] 已订阅PostgreSQL CDC")
 
-      state = %{postgres_changes: add_id_to_postgres_changes(pg_change_params)}
+              state = %{postgres_changes: add_id_to_postgres_changes(pg_change_params)}
 
-      assigns = %{
-        ack_broadcast: !!params["config"]["broadcast"]["ack"],
-        confirm_token_ref: confirm_token_ref,
-        is_new_api: is_new_api,
-        pg_sub_ref: nil,
-        pg_change_params: pg_change_params,
-        presence_key: presence_key(params),
-        self_broadcast: !!params["config"]["broadcast"]["self"],
-        tenant_topic: tenant_topic,
-        channel_name: sub_topic
-      }
+              assigns = %{
+                ack_broadcast: !!params["config"]["broadcast"]["ack"],
+                confirm_token_ref: confirm_token_ref,
+                is_new_api: is_new_api,
+                pg_sub_ref: nil,
+                pg_change_params: pg_change_params,
+                presence_key: presence_key(params),
+                self_broadcast: !!params["config"]["broadcast"]["self"],
+                tenant_topic: tenant_topic,
+                channel_name: sub_topic
+              }
+              
+              Logger.debug("[WS-INIT-DEBUG] Socket分配已创建 - 确认广播: #{!!params["config"]["broadcast"]["ack"]}, 自广播: #{!!params["config"]["broadcast"]["self"]}")
+              Logger.debug("[WS-INIT-DEBUG] 在线状态键: #{presence_key(params)}")
 
-      # Start presence and add user
-      send(self(), :sync_presence)
-      Realtime.UsersCounter.add(transport_pid, tenant_id)
-      SocketDisconnect.add(tenant_id, socket)
+              # Start presence and add user
+              send(self(), :sync_presence)
+              Realtime.UsersCounter.add(transport_pid, tenant_id)
+              SocketDisconnect.add(tenant_id, socket)
+              Logger.debug("[WS-INIT-DEBUG] 在线状态同步已触发, 用户计数器已增加")
 
-      {:ok, state, assign(socket, assigns)}
+              Logger.debug("[WS-INIT-DEBUG] WebSocket连接初始化完成 - 租户: #{tenant_id}, 主题: #{topic}")
+              {:ok, state, assign(socket, assigns)}
+            
+            error -> 
+              Logger.debug("[WS-INIT-DEBUG] 策略分配失败 - 错误: #{inspect(error)}")
+              error
+          end
+          
+        error -> 
+          Logger.debug("[WS-INIT-DEBUG] 数据库连接失败 - 错误: #{inspect(error)}")
+          error
+      end
+    end
     else
       {:error, :expired_token, msg} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 令牌已过期: #{msg}")
         Logging.log_error_message(:error, "InvalidJWTToken", msg)
 
       {:error, :missing_claims} ->
         msg = "Fields `role` and `exp` are required in JWT"
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 缺少必要的令牌声明: #{msg}")
         Logging.log_error_message(:error, "InvalidJWTToken", msg)
 
       {:error, :unauthorized, msg} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 未授权: #{msg}")
         Logging.log_error_message(:error, "Unauthorized", msg)
 
       {:error, :too_many_channels} ->
         msg = "Too many channels"
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 通道数量超限")
         Logging.log_error_message(:error, "ChannelRateLimitReached", msg)
 
       {:error, :too_many_connections} ->
         msg = "Too many connected users"
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 连接用户数超限")
         Logging.log_error_message(:error, "ConnectionRateLimitReached", msg)
 
       {:error, :too_many_joins} ->
         msg = "Too many joins per second"
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 每秒加入次数超限")
         Logging.log_error_message(:error, "ClientJoinRateLimitReached", msg)
 
       {:error, :increase_connection_pool} ->
         msg = "Please increase your connection pool size"
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 需要增加连接池大小")
         Logging.log_error_message(:error, "IncreaseConnectionPool", msg)
 
       {:error, :tenant_db_too_many_connections} ->
         msg = "Database can't accept more connections, Realtime won't connect"
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 数据库连接数超限")
         Logging.log_error_message(:error, "DatabaseLackOfConnections", msg)
 
       {:error, :unable_to_set_policies, error} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 无法设置策略: #{inspect(error)}")
         Logging.log_error_message(:error, "UnableToSetPolicies", error)
         {:error, %{reason: "Realtime was unable to connect to the project database"}}
 
       {:error, :tenant_database_unavailable} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 租户数据库不可用")
         Logging.log_error_message(
           :error,
           "UnableToConnectToProject",
@@ -145,12 +194,15 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :rpc_error, :timeout} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - RPC调用超时")
         Logging.log_error_message(:error, "TimeoutOnRpcCall", "Node request timeout")
 
       {:error, :rpc_error, reason} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - RPC调用错误: #{inspect(reason)}")
         Logging.log_error_message(:error, "ErrorOnRpcCall", "RPC call error: " <> inspect(reason))
 
       {:error, :initializing} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 项目连接正在初始化")
         Logging.log_error_message(
           :error,
           "InitializingProjectConnection",
@@ -158,6 +210,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :tenant_database_connection_initializing} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 租户数据库连接正在初始化")
         Logging.log_error_message(
           :error,
           "InitializingProjectConnection",
@@ -165,9 +218,11 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :token_malformed, msg} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 令牌格式错误: #{msg}")
         Logging.log_error_message(:error, "MalformedJWT", msg)
 
       {:error, invalid_exp} when is_integer(invalid_exp) and invalid_exp <= 0 ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 令牌过期时间无效: #{invalid_exp}")
         Logging.log_error_message(
           :error,
           "InvalidJWTExpiration",
@@ -175,6 +230,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :private_only} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 项目仅允许私有通道")
         Logging.log_error_message(
           :error,
           "PrivateOnly",
@@ -182,6 +238,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :tenant_not_found} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 租户不存在")
         Logging.log_error_message(
           :error,
           "TenantNotFound",
@@ -189,6 +246,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :tenant_suspended} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - 租户已暂停")
         Logging.log_error_message(
           :error,
           "RealtimeDisabledForTenant",
@@ -196,6 +254,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         )
 
       {:error, :signature_error} ->
+        Logger.debug("[WS-INIT-DEBUG] WebSocket连接失败 - JWT签名验证失败")
         Logging.log_error_message(:error, "JwtSignatureError", "Failed to validate JWT signature")
 
       {:error, :shutdown_in_progress} ->
@@ -564,23 +623,38 @@ defmodule RealtimeWeb.RealtimeChannel do
   defp assign_access_token(%{assigns: %{headers: headers}} = socket, params) do
     access_token = Map.get(params, "access_token") || Map.get(params, "user_token")
     {_, header} = Enum.find(headers, {nil, nil}, fn {k, _} -> k == "x-api-key" end)
+    
+    Logger.debug("[WS-INIT-DEBUG] 分配访问令牌 - 租户: #{socket.assigns.tenant}")
+    Logger.debug("[WS-INIT-DEBUG] 参数中的令牌: #{if access_token, do: String.slice(access_token, 0, 20) <> "...", else: "无"}")
+    Logger.debug("[WS-INIT-DEBUG] 头部中的令牌: #{if header, do: String.slice(header, 0, 20) <> "...", else: "无"}")
 
     case access_token do
-      nil -> assign(socket, :access_token, header)
-      "sb_" <> _ -> assign(socket, :access_token, header)
-      _ -> handle_access_token(socket, params)
+      nil -> 
+        Logger.debug("[WS-INIT-DEBUG] 使用头部令牌 - 参数中无令牌")
+        assign(socket, :access_token, header)
+      "sb_" <> _ -> 
+        Logger.debug("[WS-INIT-DEBUG] 使用头部令牌 - 参数中的令牌以sb_开头")
+        assign(socket, :access_token, header)
+      _ -> 
+        Logger.debug("[WS-INIT-DEBUG] 使用参数中的令牌")
+        handle_access_token(socket, params)
     end
   end
 
-  defp assign_access_token(socket, params), do: handle_access_token(socket, params)
+  defp assign_access_token(socket, params) do
+    Logger.debug("[WS-INIT-DEBUG] 分配访问令牌(无头部) - 租户: #{socket.assigns.tenant}")
+    handle_access_token(socket, params)
+  end
 
   defp handle_access_token(%{assigns: %{tenant_token: _tenant_token}} = socket, %{"user_token" => user_token})
        when is_binary(user_token) do
+    Logger.debug("[WS-INIT-DEBUG] 使用user_token参数 - 令牌: #{String.slice(user_token, 0, 20)}...")
     assign(socket, :access_token, user_token)
   end
 
   defp handle_access_token(%{assigns: %{tenant_token: _tenant_token}} = socket, %{"access_token" => access_token})
        when is_binary(access_token) do
+    Logger.debug("[WS-INIT-DEBUG] 使用access_token参数 - 令牌: #{String.slice(access_token, 0, 20)}...")
     assign(socket, :access_token, access_token)
   end
 
@@ -598,30 +672,68 @@ defmodule RealtimeWeb.RealtimeChannel do
     topic = Map.get(assigns, :topic)
     socket = Map.put(socket, :policies, nil)
     jwt_jwks = Map.get(assigns, :jwt_jwks)
+    
+    Logger.debug("[WS-TOKEN-DEBUG] 开始令牌验证 - 租户: #{tenant_id}, 主题: #{topic}")
+    Logger.debug("[WS-TOKEN-DEBUG] 令牌: #{String.slice(access_token || "", 0, 20)}...")
 
-    with jwt_secret_dec <- Crypto.decrypt!(jwt_secret),
-         {:ok, %{"exp" => exp} = claims} when is_integer(exp) <-
-           ChannelsAuthorization.authorize_conn(access_token, jwt_secret_dec, jwt_jwks),
-         exp_diff when exp_diff > 0 <- exp - Joken.current_time(),
-         {:ok, db_conn} <- Connect.lookup_or_start_connection(tenant_id),
-         {:ok, socket} <- maybe_assign_policies(topic, db_conn, socket) do
-      if ref = assigns[:confirm_token_ref], do: Helpers.cancel_timer(ref)
-
-      interval = min(@confirm_token_ms_interval, exp_diff * 1000)
-      ref = Process.send_after(self(), :confirm_token, interval)
-
-      {:ok, claims, ref, access_token, socket}
+    with jwt_secret_dec <- Crypto.decrypt!(jwt_secret) do
+      Logger.debug("[WS-TOKEN-DEBUG] JWT密钥解密成功")
+      
+      case ChannelsAuthorization.authorize_conn(access_token, jwt_secret_dec, jwt_jwks) do
+        {:ok, %{"exp" => exp} = claims} when is_integer(exp) ->
+          Logger.debug("[WS-TOKEN-DEBUG] 令牌授权成功 - 过期时间: #{exp}, 角色: #{claims["role"]}")
+          
+          exp_diff = exp - Joken.current_time()
+          if exp_diff > 0 do
+            Logger.debug("[WS-TOKEN-DEBUG] 令牌有效期检查通过 - 剩余时间: #{exp_diff}秒")
+            
+            case Connect.lookup_or_start_connection(tenant_id) do
+              {:ok, db_conn} ->
+                Logger.debug("[WS-TOKEN-DEBUG] 数据库连接成功 - 租户: #{tenant_id}")
+                
+                case maybe_assign_policies(topic, db_conn, socket) do
+                  {:ok, socket} ->
+                    if ref = assigns[:confirm_token_ref], do: Helpers.cancel_timer(ref)
+                    
+                    interval = min(@confirm_token_ms_interval, exp_diff * 1000)
+                    ref = Process.send_after(self(), :confirm_token, interval)
+                    Logger.debug("[WS-TOKEN-DEBUG] 令牌验证完成 - 下次验证间隔: #{interval}ms")
+                    
+                    {:ok, claims, ref, access_token, socket}
+                    
+                  error ->
+                    Logger.debug("[WS-TOKEN-DEBUG] 策略分配失败 - 错误: #{inspect(error)}")
+                    error
+                end
+                
+              error ->
+                Logger.debug("[WS-TOKEN-DEBUG] 数据库连接失败 - 错误: #{inspect(error)}")
+                error
+            end
+          else
+            Logger.debug("[WS-TOKEN-DEBUG] 令牌已过期 - 过期时间差: #{exp_diff}秒")
+            {:error, :expired_token, "Token has expired"}
+          end
+          
+        {:error, reason} ->
+          Logger.debug("[WS-TOKEN-DEBUG] 令牌授权失败 - 原因: #{inspect(reason)}")
+          {:error, reason}
+      end
     else
       {:error, :token_malformed} ->
+        Logger.debug("[WS-TOKEN-DEBUG] 令牌格式错误")
         {:error, :token_malformed, "The token provided is not a valid JWT"}
 
       {:error, error} ->
+        Logger.debug("[WS-TOKEN-DEBUG] 令牌验证错误 - #{inspect(error)}")
         {:error, error}
 
       {:error, error, message} ->
+        Logger.debug("[WS-TOKEN-DEBUG] 令牌验证错误 - #{inspect(error)}: #{message}")
         {:error, error, message}
 
       e ->
+        Logger.debug("[WS-TOKEN-DEBUG] 令牌验证未知错误 - #{inspect(e)}")
         {:error, e}
     end
   end
@@ -770,28 +882,40 @@ defmodule RealtimeWeb.RealtimeChannel do
        when not is_nil(topic) and not is_nil(db_conn) do
     authorization_context = socket.assigns.authorization_context
     policies = socket.assigns.policies || %Policies{}
+    
+    Logger.debug("[WS-RLS-DEBUG] 开始为私有通道分配策略 - 租户: #{socket.assigns.tenant}, 主题: #{topic}")
 
     with {:ok, policies} <- Authorization.get_read_authorizations(policies, db_conn, authorization_context) do
       socket = assign(socket, :policies, policies)
+      
+      Logger.debug("[WS-RLS-DEBUG] 策略分配成功 - 策略: #{inspect(policies)}")
 
-      if match?(%Policies{broadcast: %BroadcastPolicies{read: false}}, socket.assigns.policies),
-        do: {:error, :unauthorized, "You do not have permissions to read from this Channel topic: #{topic}"},
-        else: {:ok, socket}
+      if match?(%Policies{broadcast: %BroadcastPolicies{read: false}}, socket.assigns.policies) do
+        Logger.debug("[WS-RLS-DEBUG] 读取权限检查失败 - 无权限读取主题: #{topic}")
+        {:error, :unauthorized, "You do not have permissions to read from this Channel topic: #{topic}"}
+      else
+        Logger.debug("[WS-RLS-DEBUG] 读取权限检查通过 - 主题: #{topic}")
+        {:ok, socket}
+      end
     else
       {:error, :increase_connection_pool} ->
+        Logger.debug("[WS-RLS-DEBUG] 策略分配失败 - 需要增加连接池")
         {:error, :increase_connection_pool}
 
       {:error, :rls_policy_error, error} ->
+        Logger.debug("[WS-RLS-DEBUG] 策略分配失败 - RLS策略错误: #{inspect(error)}")
         log_error("RlsPolicyError", error)
 
         {:error, :unauthorized, "You do not have permissions to read from this Channel topic: #{topic}"}
 
       {:error, error} ->
+        Logger.debug("[WS-RLS-DEBUG] 策略分配失败 - 错误: #{inspect(error)}")
         {:error, :unable_to_set_policies, error}
     end
   end
 
   defp maybe_assign_policies(_, _, socket) do
+    Logger.debug("[WS-RLS-DEBUG] 跳过策略分配 - 公共通道")
     {:ok, assign(socket, policies: nil)}
   end
 

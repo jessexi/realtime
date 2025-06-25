@@ -60,16 +60,28 @@ defmodule Realtime.Tenants.Authorization do
   @spec get_read_authorizations(Policies.t(), pid(), t()) ::
           {:ok, Policies.t()} | {:error, any()} | {:error, :rls_policy_error, any()}
   def get_read_authorizations(policies, db_conn, authorization_context) when node() == node(db_conn) do
+    Logger.debug("[RLS-DEBUG] 开始读取授权检查 - 租户: #{authorization_context.tenant_id}, 主题: #{authorization_context.topic}, 角色: #{authorization_context.role}")
+    
     case get_read_policies_for_connection(db_conn, authorization_context, policies) do
-      {:ok, %Policies{} = policies} -> {:ok, policies}
-      {:ok, {:error, %Postgrex.Error{} = error}} -> {:error, :rls_policy_error, error}
-      {:error, %ConnectionError{reason: :queue_timeout}} -> {:error, :increase_connection_pool}
-      {:error, error} -> {:error, error}
+      {:ok, %Policies{} = policies} -> 
+        Logger.debug("[RLS-DEBUG] 读取授权检查成功 - 策略: #{inspect(policies)}")
+        {:ok, policies}
+      {:ok, {:error, %Postgrex.Error{} = error}} -> 
+        Logger.debug("[RLS-DEBUG] 读取授权检查失败 - RLS策略错误: #{inspect(error)}")
+        {:error, :rls_policy_error, error}
+      {:error, %ConnectionError{reason: :queue_timeout}} -> 
+        Logger.debug("[RLS-DEBUG] 读取授权检查失败 - 连接池超时")
+        {:error, :increase_connection_pool}
+      {:error, error} -> 
+        Logger.debug("[RLS-DEBUG] 读取授权检查失败 - 错误: #{inspect(error)}")
+        {:error, error}
     end
   end
 
   # Remote call
   def get_read_authorizations(policies, db_conn, authorization_context) do
+    Logger.debug("[RLS-DEBUG] 开始远程读取授权检查 - 租户: #{authorization_context.tenant_id}, 主题: #{authorization_context.topic}, 节点: #{node(db_conn)}")
+    
     case Rpc.enhanced_call(
            node(db_conn),
            __MODULE__,
@@ -77,8 +89,12 @@ defmodule Realtime.Tenants.Authorization do
            [policies, db_conn, authorization_context],
            tenant_id: authorization_context.tenant_id
          ) do
-      {:error, :rpc_error, reason} -> {:error, reason}
-      response -> response
+      {:error, :rpc_error, reason} -> 
+        Logger.debug("[RLS-DEBUG] 远程读取授权检查失败 - RPC错误: #{inspect(reason)}")
+        {:error, reason}
+      response -> 
+        Logger.debug("[RLS-DEBUG] 远程读取授权检查完成 - 响应: #{inspect(response)}")
+        response
     end
   end
 
@@ -90,16 +106,28 @@ defmodule Realtime.Tenants.Authorization do
   @spec get_write_authorizations(Policies.t(), pid(), __MODULE__.t()) ::
           {:ok, Policies.t()} | {:error, any()} | {:error, :rls_policy_error, any()}
   def get_write_authorizations(policies, db_conn, authorization_context) when node() == node(db_conn) do
+    Logger.debug("[RLS-DEBUG] 开始写入授权检查 - 租户: #{authorization_context.tenant_id}, 主题: #{authorization_context.topic}, 角色: #{authorization_context.role}")
+    
     case get_write_policies_for_connection(db_conn, authorization_context, policies) do
-      {:ok, %Policies{} = policies} -> {:ok, policies}
-      {:ok, {:error, %Postgrex.Error{} = error}} -> {:error, :rls_policy_error, error}
-      {:error, %ConnectionError{reason: :queue_timeout}} -> {:error, :increase_connection_pool}
-      {:error, error} -> {:error, error}
+      {:ok, %Policies{} = policies} -> 
+        Logger.debug("[RLS-DEBUG] 写入授权检查成功 - 策略: #{inspect(policies)}")
+        {:ok, policies}
+      {:ok, {:error, %Postgrex.Error{} = error}} -> 
+        Logger.debug("[RLS-DEBUG] 写入授权检查失败 - RLS策略错误: #{inspect(error)}")
+        {:error, :rls_policy_error, error}
+      {:error, %ConnectionError{reason: :queue_timeout}} -> 
+        Logger.debug("[RLS-DEBUG] 写入授权检查失败 - 连接池超时")
+        {:error, :increase_connection_pool}
+      {:error, error} -> 
+        Logger.debug("[RLS-DEBUG] 写入授权检查失败 - 错误: #{inspect(error)}")
+        {:error, error}
     end
   end
 
   # Remote call
   def get_write_authorizations(policies, db_conn, authorization_context) do
+    Logger.debug("[RLS-DEBUG] 开始远程写入授权检查 - 租户: #{authorization_context.tenant_id}, 主题: #{authorization_context.topic}, 节点: #{node(db_conn)}")
+    
     case Rpc.enhanced_call(
            node(db_conn),
            __MODULE__,
@@ -107,8 +135,12 @@ defmodule Realtime.Tenants.Authorization do
            [policies, db_conn, authorization_context],
            tenant_id: authorization_context.tenant_id
          ) do
-      {:error, :rpc_error, reason} -> {:error, reason}
-      response -> response
+      {:error, :rpc_error, reason} -> 
+        Logger.debug("[RLS-DEBUG] 远程写入授权检查失败 - RPC错误: #{inspect(reason)}")
+        {:error, reason}
+      response -> 
+        Logger.debug("[RLS-DEBUG] 远程写入授权检查完成 - 响应: #{inspect(response)}")
+        response
     end
   end
 
@@ -137,6 +169,8 @@ defmodule Realtime.Tenants.Authorization do
 
     claims = Jason.encode!(claims)
     headers = headers |> Map.new() |> Jason.encode!()
+    
+    Logger.debug("[RLS-DEBUG] 设置数据库连接配置 - 角色: #{role}, 主题: #{topic}")
 
     Postgrex.query(
       conn,
@@ -155,6 +189,8 @@ defmodule Realtime.Tenants.Authorization do
     tenant_id = authorization_context.tenant_id
     opts = [telemetry: [:realtime, :tenants, :read_authorization_check], tenant_id: tenant_id]
     metadata = [project: tenant_id, external_id: tenant_id, tenant_id: tenant_id]
+    
+    Logger.debug("[RLS-DEBUG] 开始读取策略事务 - 租户: #{tenant_id}, 主题: #{authorization_context.topic}")
 
     Database.transaction(
       conn,
@@ -174,6 +210,8 @@ defmodule Realtime.Tenants.Authorization do
 
         {[%{id: broadcast_id}], [%{id: presence_id}]} =
           Enum.split_with(messages, &(&1.extension == :broadcast))
+          
+        Logger.debug("[RLS-DEBUG] 创建消息记录 - 广播ID: #{broadcast_id}, 在线状态ID: #{presence_id}")
 
         set_conn_config(transaction_conn, authorization_context)
 
@@ -198,6 +236,8 @@ defmodule Realtime.Tenants.Authorization do
     tenant_id = authorization_context.tenant_id
     opts = [telemetry: [:realtime, :tenants, :write_authorization_check], tenant_id: tenant_id]
     metadata = [project: tenant_id, external_id: tenant_id]
+    
+    Logger.debug("[RLS-DEBUG] 开始写入策略事务 - 租户: #{tenant_id}, 主题: #{authorization_context.topic}")
 
     Database.transaction(
       conn,
@@ -233,10 +273,14 @@ defmodule Realtime.Tenants.Authorization do
         where: [extension: :broadcast, id: ^broadcast_id],
         or_where: [extension: :presence, id: ^presence_id]
       )
+      
+    Logger.debug("[RLS-DEBUG] 执行读取策略查询 - 主题: #{authorization_context.topic}, 广播ID: #{broadcast_id}, 在线状态ID: #{presence_id}")
 
     with {:ok, res} <- Repo.all(conn, query, Message) do
       can_presence? = Enum.any?(res, fn %{id: id} -> id == presence_id end)
       can_broadcast? = Enum.any?(res, fn %{id: id} -> id == broadcast_id end)
+      
+      Logger.debug("[RLS-DEBUG] 读取策略查询结果 - 可广播: #{can_broadcast?}, 可在线状态: #{can_presence?}")
 
       policies
       |> Policies.update_policies(:presence, :read, can_presence?)
@@ -254,27 +298,35 @@ defmodule Realtime.Tenants.Authorization do
 
     presence_changeset =
       Message.changeset(%Message{}, %{topic: authorization_context.topic, extension: :presence})
+      
+    Logger.debug("[RLS-DEBUG] 开始写入策略检查 - 主题: #{authorization_context.topic}")
 
     policies =
       case Repo.insert(conn, broadcast_changeset, Message, mode: :savepoint) do
         {:ok, _} ->
+          Logger.debug("[RLS-DEBUG] 广播写入权限检查通过")
           Policies.update_policies(policies, :broadcast, :write, true)
 
         {:error, %Postgrex.Error{postgres: %{code: :insufficient_privilege}}} ->
+          Logger.debug("[RLS-DEBUG] 广播写入权限检查失败 - 权限不足")
           Policies.update_policies(policies, :broadcast, :write, false)
 
         e ->
+          Logger.debug("[RLS-DEBUG] 广播写入权限检查错误 - #{inspect(e)}")
           e
       end
 
     case Repo.insert(conn, presence_changeset, Message, mode: :savepoint) do
       {:ok, _} ->
+        Logger.debug("[RLS-DEBUG] 在线状态写入权限检查通过")
         Policies.update_policies(policies, :presence, :write, true)
 
       {:error, %Postgrex.Error{postgres: %{code: :insufficient_privilege}}} ->
+        Logger.debug("[RLS-DEBUG] 在线状态写入权限检查失败 - 权限不足")
         Policies.update_policies(policies, :presence, :write, false)
 
       e ->
+        Logger.debug("[RLS-DEBUG] 在线状态写入权限检查错误 - #{inspect(e)}")
         e
     end
   end
